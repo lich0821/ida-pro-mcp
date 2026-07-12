@@ -52,6 +52,7 @@ IDB_OPEN_MODES = {
 IDB_MANAGEMENT_TOOLS = {
     "idb_open",
     "idb_list",
+    "idb_close",
 }
 # Health-probe timeouts. A busy worker (mid auto-analysis / decompile) runs
 # single-threaded and cannot answer a JSON-RPC ping until it yields, so a tight
@@ -152,6 +153,15 @@ class IdalibOpenResult(TypedDict, total=False):
 class IdalibListResult(TypedDict, total=False):
     sessions: list[IdalibSessionListInfo]
     count: int
+    error: str
+
+
+class IdalibCloseResult(TypedDict, total=False):
+    success: bool
+    session_id: str
+    terminated: bool
+    saved: bool | None
+    save_error: str | None
     error: str
 
 
@@ -1031,6 +1041,47 @@ class IdalibSupervisor:
             )
         return adopted + unadopted
 
+    def close_session(self, session_id: str, *, save: bool = True) -> IdalibCloseResult:
+        with self._lock:
+            session = self.sessions.get(session_id)
+            if session is None:
+                raise RuntimeError(f"Session not found: {session_id}")
+            self._unregister_session_locked(session_id)
+
+        saved: bool | None = None
+        save_error: str | None = None
+        if save and self._session_is_reachable(session):
+            try:
+                save_result = self.call_worker_tool(session, "idb_save", {})
+                saved = bool(save_result.get("ok")) if isinstance(save_result, dict) else False
+                if not saved and isinstance(save_result, dict):
+                    save_error = save_result.get("error") or "idb_save returned false"
+            except Exception as e:
+                saved = False
+                save_error = str(e)
+                logger.warning(
+                    "idb_save before close failed for session %s: %s", session_id, e
+                )
+
+        terminated = False
+        if session.backend == "worker" and session.owned:
+            self._terminate_worker(session)
+            terminated = True
+            try:
+                _discovery.unregister_instance(session.port)
+            except Exception:
+                logger.debug(
+                    "Failed to unregister worker %s from discovery", session_id, exc_info=True
+                )
+
+        return {
+            "success": True,
+            "session_id": session_id,
+            "terminated": terminated,
+            "saved": saved,
+            "save_error": save_error,
+        }
+
     # ------------------------------------------------------------------
     # Schema/resource forwarding
     # ------------------------------------------------------------------
@@ -1159,6 +1210,25 @@ def idb_list() -> IdalibListResult:
         return {"sessions": sessions, "count": len(sessions)}
     except Exception as e:
         return {"error": f"Failed to list sessions: {e}"}
+
+
+@mcp.tool
+def idb_close(
+    session_id: Annotated[str, "Session ID returned by idb_open"],
+    save: Annotated[bool, "Save the database before closing"] = True,
+) -> IdalibCloseResult:
+    """Close a session opened via idb_open.
+
+    Saves the database first by default (pass save=false to skip). Terminates
+    the underlying worker process only if this supervisor owns it; a session
+    adopted from another supervisor or a GUI instance is left running and only
+    the supervisor's own bookkeeping is dropped.
+    """
+    sup = _require_supervisor()
+    try:
+        return sup.close_session(session_id, save=save)
+    except Exception as e:
+        return {"error": str(e)}
 
 
 @mcp.resource("ida://databases")

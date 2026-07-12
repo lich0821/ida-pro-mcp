@@ -908,14 +908,13 @@ def test_supervisor_uses_idb_prefixed_management_tools_only():
         "idalib_close",
         "idalib_list",
         "idalib_save",
-        "idb_close",
         "idalib_switch",
         "idalib_unbind",
         "idalib_current",
         "idalib_warmup",
         "idalib_health",
     }
-    assert supmod.IDB_MANAGEMENT_TOOLS == {"idb_open", "idb_list"}
+    assert supmod.IDB_MANAGEMENT_TOOLS == {"idb_open", "idb_list", "idb_close"}
     for name in legacy:
         assert not hasattr(supmod, name), f"{name} should have been deleted"
     for typename in ("IdalibWarmupResult", "IdalibHealthResult"):
@@ -1170,3 +1169,101 @@ def test_closed_gui_session_does_not_reappear_if_closed_during_headless_fallback
         assert sup.spawned[-1].process.returncode == 0
     finally:
         restore()
+
+
+def test_close_session_saves_and_terminates_owned_worker(tmp_path):
+    sample = tmp_path / "sample.bin"
+    sample.write_bytes(b"x")
+    sup = _FakeSupervisor()
+    session = sup.open_session(str(sample), session_id="sample")
+
+    result = sup.close_session("sample")
+
+    assert result["success"] is True
+    assert result["terminated"] is True
+    assert result["saved"] is True
+    assert ("idb_save", {}) in sup.tool_calls
+    assert "sample" not in sup.sessions
+    assert session.process.returncode == 0  # terminate() was called
+
+
+def test_close_session_skips_save_when_disabled(tmp_path):
+    sample = tmp_path / "sample.bin"
+    sample.write_bytes(b"x")
+    sup = _FakeSupervisor()
+    sup.open_session(str(sample), session_id="sample")
+
+    result = sup.close_session("sample", save=False)
+
+    assert result["saved"] is None
+    assert ("idb_save", {}) not in sup.tool_calls
+
+
+def test_close_session_does_not_kill_adopted_worker(tmp_path):
+    sample = tmp_path / "sample.bin"
+    sample.write_bytes(b"x")
+    sup = _FakeSupervisor()
+    session = sup.open_session(str(sample), session_id="sample")
+    session.owned = False  # simulate a worker adopted from another supervisor
+
+    result = sup.close_session("sample")
+
+    assert result["terminated"] is False
+    assert result["saved"] is True  # still saved even though not owned
+    assert "sample" not in sup.sessions
+    assert session.process.returncode is None  # never terminated
+
+
+def test_close_session_unknown_id_raises():
+    sup = _FakeSupervisor()
+    try:
+        sup.close_session("does-not-exist")
+    except RuntimeError as e:
+        assert "not found" in str(e)
+    else:
+        raise AssertionError("expected RuntimeError")
+
+
+def test_close_session_save_failure_does_not_block_termination(tmp_path):
+    sample = tmp_path / "sample.bin"
+    sample.write_bytes(b"x")
+    sup = _FakeSupervisor()
+    session = sup.open_session(str(sample), session_id="sample")
+
+    def failing_call_worker_tool(worker, name, arguments=None, *, timeout=None):
+        if name == "idb_save":
+            raise RuntimeError("worker is busy")
+        raise AssertionError(f"unexpected tool call: {name}")
+
+    sup.call_worker_tool = failing_call_worker_tool
+
+    result = sup.close_session("sample")
+
+    assert result["terminated"] is True
+    assert result["saved"] is False
+    assert result["save_error"] == "worker is busy"
+    assert "sample" not in sup.sessions
+
+
+def test_close_session_skips_save_when_unreachable(tmp_path):
+    sample = tmp_path / "sample.bin"
+    sample.write_bytes(b"x")
+    sup = _FakeSupervisor()
+    session = sup.open_session(str(sample), session_id="sample")
+    session.process = _DeadProcess()
+
+    result = sup.close_session("sample")
+
+    assert result["saved"] is None
+    assert ("idb_save", {}) not in sup.tool_calls
+    assert result["terminated"] is True
+
+
+def test_idb_close_tool_is_in_management_tools_and_dispatches_locally():
+    request = {
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "tools/call",
+        "params": {"name": "idb_close", "arguments": {"session_id": "sample"}},
+    }
+    assert request["params"]["name"] in supmod.IDB_MANAGEMENT_TOOLS
